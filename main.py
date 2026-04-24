@@ -1,180 +1,181 @@
 from flask import Flask, request, jsonify
-import subprocess, requests, os, uuid, json, base64
+import subprocess, requests, os, uuid, json, base64, shutil
 from pathlib import Path
 
 app = Flask(__name__)
 
 # ============================================================
-# CẤU HÌNH — chỉnh sửa theo nhu cầu của bạn
+# CẤU HÌNH
 # ============================================================
-LOGO_PATH      = "/app/assets/logo.png"      # logo/watermark của bạn
-INTRO_PATH     = "/app/assets/intro.mp4"     # video intro (2-3 giây)
-OUTRO_PATH     = "/app/assets/outro.mp4"     # video outro (2-3 giây)
-FONT_PATH      = "/app/assets/font.ttf"      # font chữ tiếng Việt (Roboto/NotoSans)
-OUTPUT_DIR     = "/tmp/outputs"
+LOGO_PATH   = "/app/assets/logo.png"
+INTRO_PATH  = "/app/assets/intro.mp4"
+OUTRO_PATH  = "/app/assets/outro.mp4"
+FONT_PATH   = "/app/assets/font.ttf"
+OUTPUT_DIR  = "/tmp/outputs"
 # ============================================================
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+def download_from_google_drive(file_id: str, dest: str):
+    """Download file từ Google Drive — xử lý virus scan warning"""
+    session  = requests.Session()
+    url      = f"https://drive.google.com/uc?export=download&id={file_id}"
+    response = session.get(url, stream=True, timeout=120)
+
+    # Nếu file lớn, Google yêu cầu confirm
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            token = value
+            break
+
+    if token:
+        url      = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={token}"
+        response = session.get(url, stream=True, timeout=120)
+
+    response.raise_for_status()
+    with open(dest, "wb") as f:
+        for chunk in response.iter_content(chunk_size=65536):
+            if chunk:
+                f.write(chunk)
+
+    print(f"Drive download done: {os.path.getsize(dest)/1024/1024:.1f} MB")
+
+
 def download_file(url: str, dest: str):
-    """Download file từ URL về local"""
-    r = requests.get(url, stream=True, timeout=120)
+    """Download file — tự nhận biết Google Drive hay URL thường"""
+    if "drive.google.com" in url:
+        if "id=" in url:
+            file_id = url.split("id=")[1].split("&")[0]
+        elif "/file/d/" in url:
+            file_id = url.split("/file/d/")[1].split("/")[0]
+        else:
+            raise Exception(f"Cannot extract Drive file ID from: {url}")
+        download_from_google_drive(file_id, dest)
+        return
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    r = requests.get(url, stream=True, timeout=120, headers=headers)
     r.raise_for_status()
     with open(dest, "wb") as f:
         for chunk in r.iter_content(chunk_size=65536):
-            f.write(chunk)
+            if chunk:
+                f.write(chunk)
 
 
-def create_subtitle_file(subtitle_text: str, duration: float, path: str):
-    """Tạo file SRT phụ đề đơn giản"""
-    # Chia caption thành các đoạn 3 giây
-    words   = subtitle_text.split()
-    chunks  = []
-    chunk_size = 6  # 6 từ mỗi dòng
-    for i in range(0, len(words), chunk_size):
-        chunks.append(" ".join(words[i:i+chunk_size]))
-
-    segment_duration = duration / max(len(chunks), 1)
-    srt_content = ""
+def create_subtitle_file(text: str, duration: float, path: str):
+    words      = text.split()
+    chunks     = [" ".join(words[i:i+6]) for i in range(0, len(words), 6)] or [text]
+    seg_dur    = duration / max(len(chunks), 1)
+    content    = ""
     for i, chunk in enumerate(chunks):
-        start = i * segment_duration
-        end   = min((i + 1) * segment_duration, duration)
-        start_ts = format_timestamp(start)
-        end_ts   = format_timestamp(end)
-        srt_content += f"{i+1}\n{start_ts} --> {end_ts}\n{chunk}\n\n"
-
+        s = i * seg_dur
+        e = min((i + 1) * seg_dur, duration)
+        content += f"{i+1}\n{ts(s)} --> {ts(e)}\n{chunk}\n\n"
     with open(path, "w", encoding="utf-8") as f:
-        f.write(srt_content)
+        f.write(content)
 
 
-def format_timestamp(seconds: float) -> str:
-    h  = int(seconds // 3600)
-    m  = int((seconds % 3600) // 60)
-    s  = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
+def ts(sec: float) -> str:
+    h, r = divmod(int(sec), 3600)
+    m, s = divmod(r, 60)
+    ms   = int((sec % 1) * 1000)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
-def get_video_duration(path: str) -> float:
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries",
-         "format=duration", "-of", "json", path],
+def get_duration(path: str) -> float:
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
         capture_output=True, text=True
     )
-    data = json.loads(result.stdout)
-    return float(data["format"]["duration"])
+    return float(json.loads(r.stdout)["format"]["duration"])
 
 
 def process_video(mp4_url: str, title: str, caption: str) -> str:
-    uid        = str(uuid.uuid4())[:8]
-    input_file = f"/tmp/{uid}_input.mp4"
-    sub_file   = f"/tmp/{uid}_subs.srt"
-    step1      = f"/tmp/{uid}_step1.mp4"   # sau resize 9:16
-    step2      = f"/tmp/{uid}_step2.mp4"   # sau thêm logo
-    step3      = f"/tmp/{uid}_step3.mp4"   # sau thêm phụ đề
-    final      = f"{OUTPUT_DIR}/{uid}_final.mp4"
+    uid   = str(uuid.uuid4())[:8]
+    src   = f"/tmp/{uid}_input.mp4"
+    s1    = f"/tmp/{uid}_s1.mp4"   # sau resize 9:16
+    s2    = f"/tmp/{uid}_s2.mp4"   # sau logo
+    s3    = f"/tmp/{uid}_s3.mp4"   # sau phụ đề
+    sub   = f"/tmp/{uid}.srt"
+    final = f"{OUTPUT_DIR}/{uid}_final.mp4"
 
     try:
-        # ── 1. Download video gốc ──────────────────────────────
-        print(f"[{uid}] Downloading video...")
-        download_file(mp4_url, input_file)
-        duration = get_video_duration(input_file)
-        print(f"[{uid}] Duration: {duration:.1f}s")
+        # 1 ── Download
+        print(f"[{uid}] Downloading...")
+        download_file(mp4_url, src)
+        mb = os.path.getsize(src) / 1024 / 1024
+        if mb < 0.1:
+            raise Exception("File quá nhỏ — có thể Drive bị lỗi auth")
+        dur = get_duration(src)
+        print(f"[{uid}] {mb:.1f}MB  {dur:.1f}s")
 
-        # ── 2. Resize về 9:16 (1080x1920) ─────────────────────
-        print(f"[{uid}] Step 1: Resize to 9:16...")
+        # 2 ── Resize 9:16
+        print(f"[{uid}] Resize 9:16...")
         subprocess.run([
-            "ffmpeg", "-y", "-i", input_file,
-            "-vf",
-            "scale=1080:1920:force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
+            "ffmpeg", "-y", "-i", src,
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                   "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            step1
+            "-c:a", "aac", "-b:a", "128k", s1
         ], check=True, capture_output=True)
+        cur = s1
 
-        # ── 3. Thêm logo/watermark góc trên phải ──────────────
-        current = step1
+        # 3 ── Logo watermark
         if os.path.exists(LOGO_PATH):
-            print(f"[{uid}] Step 2: Adding logo...")
+            print(f"[{uid}] Adding logo...")
             subprocess.run([
-                "ffmpeg", "-y",
-                "-i", current,
-                "-i", LOGO_PATH,
-                "-filter_complex",
-                "[1:v]scale=150:-1[logo];"
-                "[0:v][logo]overlay=W-w-30:30",
+                "ffmpeg", "-y", "-i", cur, "-i", LOGO_PATH,
+                "-filter_complex", "[1:v]scale=150:-1[logo];[0:v][logo]overlay=W-w-30:30",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "copy",
-                step2
+                "-c:a", "copy", s2
             ], check=True, capture_output=True)
-            current = step2
-        else:
-            print(f"[{uid}] Logo not found, skipping...")
+            cur = s2
 
-        # ── 4. Thêm phụ đề tiếng Việt ─────────────────────────
+        # 4 ── Phụ đề tiếng Việt
         if caption and os.path.exists(FONT_PATH):
-            print(f"[{uid}] Step 3: Adding subtitles...")
-            create_subtitle_file(caption, duration, sub_file)
-            subtitle_filter = (
-                f"subtitles={sub_file}:force_style='"
-                f"FontName=Roboto,FontSize=18,PrimaryColour=&HFFFFFF&,"
-                f"OutlineColour=&H000000&,Outline=2,Bold=1,"
-                f"Alignment=2,MarginV=80'"
-            )
+            print(f"[{uid}] Adding subtitles...")
+            create_subtitle_file(caption, dur, sub)
             subprocess.run([
-                "ffmpeg", "-y", "-i", current,
-                "-vf", subtitle_filter,
+                "ffmpeg", "-y", "-i", cur,
+                "-vf", f"subtitles={sub}:force_style='"
+                       "FontSize=18,PrimaryColour=&HFFFFFF&,"
+                       "OutlineColour=&H000000&,Outline=2,Bold=1,"
+                       "Alignment=2,MarginV=80'",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "copy",
-                step3
+                "-c:a", "copy", s3
             ], check=True, capture_output=True)
-            current = step3
-        else:
-            print(f"[{uid}] Subtitle/font not found, skipping...")
+            cur = s3
 
-        # ── 5. Ghép intro + video + outro ─────────────────────
+        # 5 ── Ghép intro + video + outro
         has_intro = os.path.exists(INTRO_PATH)
         has_outro = os.path.exists(OUTRO_PATH)
-
         if has_intro or has_outro:
-            print(f"[{uid}] Step 4: Concat intro/outro...")
-            concat_list = f"/tmp/{uid}_concat.txt"
-            with open(concat_list, "w") as f:
-                if has_intro:
-                    f.write(f"file '{INTRO_PATH}'\n")
-                f.write(f"file '{current}'\n")
-                if has_outro:
-                    f.write(f"file '{OUTRO_PATH}'\n")
-
+            print(f"[{uid}] Concat intro/outro...")
+            clist = f"/tmp/{uid}_concat.txt"
+            with open(clist, "w") as f:
+                if has_intro: f.write(f"file '{INTRO_PATH}'\n")
+                f.write(f"file '{cur}'\n")
+                if has_outro: f.write(f"file '{OUTRO_PATH}'\n")
             subprocess.run([
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", concat_list,
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", clist,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                final
+                "-c:a", "aac", "-b:a", "128k", final
             ], check=True, capture_output=True)
-            os.remove(concat_list)
+            os.remove(clist)
         else:
-            # Không có intro/outro, copy file hiện tại làm final
-            print(f"[{uid}] No intro/outro, using current as final...")
-            subprocess.run(["cp", current, final], check=True)
+            shutil.copy(cur, final)
 
-        print(f"[{uid}] Done! Output: {final}")
+        print(f"[{uid}] Final: {os.path.getsize(final)/1024/1024:.1f}MB")
         return final
 
     finally:
-        # Dọn file tạm
-        for f in [input_file, sub_file, step1, step2, step3]:
-            if os.path.exists(f):
-                os.remove(f)
+        for f in [src, s1, s2, s3, sub]:
+            if os.path.exists(f): os.remove(f)
 
 
-# ============================================================
-# API ENDPOINTS
-# ============================================================
+# ── ENDPOINTS ──────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def health():
@@ -183,53 +184,49 @@ def health():
 
 @app.route("/process", methods=["POST"])
 def handle_process():
-    data = request.json
-    if not data:
-        return jsonify({"error": "No JSON body"}), 400
-
-    mp4_url          = data.get("mp4_url", "")
-    title            = data.get("title", "video")
-    caption          = data.get("caption", "")
-    callback_webhook = data.get("callback_webhook", "")
+    data = request.json or {}
+    mp4_url  = data.get("mp4_url", "")
+    title    = data.get("title", "video")
+    caption  = data.get("caption", "")
+    hashtag  = data.get("hashtag", "")
+    callback = data.get("callback_webhook", "")
 
     if not mp4_url:
         return jsonify({"error": "mp4_url is required"}), 400
 
-    # Xử lý async — trả về 200 ngay, xử lý nền
-    # (Railway free tier có thể timeout nếu xử lý lâu)
+    print(f"Job: {title[:60]}")
     try:
-        output_path = process_video(mp4_url, title, caption)
+        out  = process_video(mp4_url, title, caption)
+        size = os.path.getsize(out)
 
-        # Đọc file output thành base64 để gửi về Make
-        with open(output_path, "rb") as f:
-            video_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-        # Dọn output
-        os.remove(output_path)
+        with open(out, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        os.remove(out)
 
         result = {
-            "status":     "success",
-            "title":      title,
-            "video_b64":  video_b64,   # Make nhận base64, decode thành file
-            "video_size":  os.path.getsize(output_path) if os.path.exists(output_path) else 0
+            "status":    "success",
+            "title":     title,
+            "caption":   caption,
+            "hashtag":   hashtag,
+            "video_b64": b64,
+            "size_mb":   round(size / 1024 / 1024, 2)
         }
 
-        # Gọi callback webhook của Make nếu có
-        if callback_webhook:
-            requests.post(callback_webhook, json=result, timeout=30)
-            return jsonify({"status": "ok", "message": "Processing done, callback sent"})
+        if callback:
+            r = requests.post(callback, json=result, timeout=60)
+            print(f"Callback → {r.status_code}")
+            return jsonify({"status": "ok", "size_mb": result["size_mb"]})
 
         return jsonify(result)
 
     except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode() if e.stderr else str(e)
-        print(f"FFmpeg error: {error_msg}")
-        return jsonify({"error": "FFmpeg processing failed", "detail": error_msg}), 500
+        err = (e.stderr or b"").decode()[-500:]
+        print(f"FFmpeg error: {err}")
+        return jsonify({"error": "FFmpeg failed", "detail": err}), 500
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
