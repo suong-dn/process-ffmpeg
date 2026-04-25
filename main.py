@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import subprocess, requests, os, uuid, json, base64, shutil, re
 from pathlib import Path
+import gdown
 
 app = Flask(__name__)
 
@@ -76,7 +77,7 @@ def download_from_google_drive(file_id: str, dest: str):
         else:
             # ── Thử 2: endpoint cũ với cookie ──────────────
             print("[Drive] Không tìm được token, thử endpoint cũ...")
-            url2 = f"https://drive.google.com/uc?export=download&id={file_id}"
+            url2 = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
             resp2 = session.get(url2, stream=True, timeout=120, headers=headers)
             resp2.raise_for_status()
             # Lấy confirm từ cookie
@@ -85,7 +86,7 @@ def download_from_google_drive(file_id: str, dest: str):
                 None
             )
             if token:
-                url2 = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={token}"
+                url2 = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing&confirm={token}"
                 resp = session.get(url2, stream=True, timeout=120, headers=headers)
                 resp.raise_for_status()
             else:
@@ -189,6 +190,25 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
 
         dur = get_duration(src)
         print(f"[{uid}] Duration: {dur:.1f}s")
+        
+        # Kiểm tra video stream
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-show_streams",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,width,height",
+            "-of", "json", src
+        ], capture_output=True, text=True)
+        probe_data = json.loads(probe.stdout)
+        video_streams = probe_data.get("streams", [])
+        print(f"[{uid}] Video streams: {video_streams}")
+
+        if not video_streams:
+            raise Exception(
+                "File không có video stream — chỉ có audio. "
+                "File MP4 trên Google Drive bị lỗi hoặc là audio file. "
+                "Hãy kiểm tra và upload lại file video."
+            )
+
 
         # 2 ── Resize 9:16
         print(f"[{uid}] Resize 9:16...")
