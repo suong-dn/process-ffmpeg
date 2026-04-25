@@ -18,29 +18,44 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def download_from_google_drive(file_id: str, dest: str):
-    """Download file từ Google Drive — xử lý virus scan warning"""
-    session  = requests.Session()
-    url      = f"https://drive.google.com/uc?export=download&id={file_id}"
-    response = session.get(url, stream=True, timeout=120)
-
-    # Nếu file lớn, Google yêu cầu confirm
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            token = value
-            break
-
-    if token:
-        url      = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={token}"
-        response = session.get(url, stream=True, timeout=120)
-
+    """Download file từ Google Drive — xử lý cả virus scan warning mới"""
+    session = requests.Session()
+    
+    # Thử endpoint mới của Google Drive
+    url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0&confirm=t"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    
+    response = session.get(url, stream=True, timeout=120, headers=headers)
     response.raise_for_status()
+    
+    # Kiểm tra có phải HTML không (tức là bị redirect sang trang cảnh báo)
+    content_type = response.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        # Thử lấy confirm token từ body HTML
+        import re
+        html = response.text
+        match = re.search(r'confirm=([0-9A-Za-z_\-]+)', html)
+        if match:
+            confirm = match.group(1)
+            url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={confirm}"
+            response = session.get(url, stream=True, timeout=120, headers=headers)
+            response.raise_for_status()
+        else:
+            raise Exception(f"Google Drive yêu cầu đăng nhập hoặc file không public. File ID: {file_id}")
+    
     with open(dest, "wb") as f:
         for chunk in response.iter_content(chunk_size=65536):
             if chunk:
                 f.write(chunk)
-
-    print(f"Drive download done: {os.path.getsize(dest)/1024/1024:.1f} MB")
+    
+    size_mb = os.path.getsize(dest) / 1024 / 1024
+    print(f"Drive download done: {size_mb:.1f} MB")
+    
+    if size_mb < 0.05:
+        raise Exception(f"File tải về quá nhỏ ({size_mb:.2f}MB) — Drive có thể chặn hoặc file không public")
 
 
 def download_file(url: str, dest: str):
@@ -103,13 +118,21 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
 
     try:
         # 1 ── Download
-        print(f"[{uid}] Downloading...")
+        print(f"[{uid}] Downloading: {mp4_url[:80]}...")
         download_file(mp4_url, src)
+
+        # Kiểm tra file
         mb = os.path.getsize(src) / 1024 / 1024
+        print(f"[{uid}] Downloaded: {mb:.2f} MB")
+
+        # Đọc vài byte đầu để verify là video thật
+        with open(src, "rb") as f:
+            header = f.read(12)
+        print(f"[{uid}] File header: {header.hex()}")  # MP4 thường bắt đầu bằng ftyp
+
         if mb < 0.1:
-            raise Exception("File quá nhỏ — có thể Drive bị lỗi auth")
-        dur = get_duration(src)
-        print(f"[{uid}] {mb:.1f}MB  {dur:.1f}s")
+            raise Exception(f"File quá nhỏ ({mb:.2f}MB) — download thất bại")
+        
 
         # 2 ── Resize 9:16
         print(f"[{uid}] Resize 9:16...")
