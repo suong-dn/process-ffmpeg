@@ -156,8 +156,12 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
             "ffmpeg", "-y", "-i", src,
             "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
                    "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", s1
+            "-c:v", "libx264",
+            "-preset", "ultrafast",   # ← đổi từ "fast" sang "ultrafast" (ít RAM hơn)
+            "-crf", "28",             # ← tăng từ 23 lên 28 (file nhỏ hơn, ít RAM hơn)
+            "-c:a", "aac", "-b:a", "96k",  # ← giảm audio bitrate
+            "-threads", "1",          # ← giới hạn thread để tránh OOM
+            s1
         ], check=True, capture_output=True)
         cur = s1
 
@@ -167,7 +171,7 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
             subprocess.run([
                 "ffmpeg", "-y", "-i", cur, "-i", LOGO_PATH,
                 "-filter_complex", "[1:v]scale=150:-1[logo];[0:v][logo]overlay=W-w-30:30",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-c:a", "copy", s2
             ], check=True, capture_output=True)
             cur = s2
@@ -182,7 +186,7 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
                        "FontSize=18,PrimaryColour=&HFFFFFF&,"
                        "OutlineColour=&H000000&,Outline=2,Bold=1,"
                        "Alignment=2,MarginV=80'",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-c:a", "copy", s3
             ], check=True, capture_output=True)
             cur = s3
@@ -199,7 +203,7 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
                 if has_outro: f.write(f"file '{OUTRO_PATH}'\n")
             subprocess.run([
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", clist,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k", final
             ], check=True, capture_output=True)
             os.remove(clist)
