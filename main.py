@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import subprocess, requests, os, uuid, json, base64, shutil, re
-from pathlib import Path
 import gdown
 
 app = Flask(__name__)
@@ -32,79 +31,18 @@ def extract_drive_file_id(url: str) -> str:
 
 
 def download_from_google_drive(file_id: str, dest: str):
-    """
-    Download file từ Google Drive.
-    Xử lý virus-scan warning page và kiểm tra nội dung thực sự là video.
-    """
-    session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
+    """Download bằng gdown — xử lý auth và warning tự động"""
+    # ✅ Dùng đúng URL format cho gdown download
+    url = f"https://drive.google.com/uc?id={file_id}"
+    print(f"[Drive] Downloading via gdown, file ID: {file_id}")
 
-    # ── Thử 1: endpoint mới với confirm=t ──────────────────
-    url = (
-        # f"https://drive.usercontent.google.com/download"
-        # f"?id={file_id}&export=download&authuser=0&confirm=t"
-        f"https://drive.google.com/file/d/"
-        f"{file_id}/view?usp=sharing&authuser=0&confirm=t"
-    )
-    resp = session.get(url, stream=True, timeout=120, headers=headers)
-    resp.raise_for_status()
+    try:
+        gdown.download(url, dest, quiet=False, fuzzy=True)
+    except Exception as e:
+        raise Exception(f"gdown thất bại: {e}")
 
-    content_type = resp.headers.get("Content-Type", "")
-    print(f"[Drive] Content-Type: {content_type}")
-
-    # Nếu trả về HTML → cần lấy confirm token từ page body
-    if "text/html" in content_type:
-        html = resp.text
-
-        # Tìm confirm token mới (dạng uuid hoặc chữ+số)
-        match = re.search(r'confirm=([0-9A-Za-z_\-]+)', html)
-        if not match:
-            # Thử tìm trong form action
-            match = re.search(r'["\']confirm["\'].*?value=["\']([^"\']+)["\']', html)
-
-        if match:
-            confirm = match.group(1)
-            print(f"[Drive] Got confirm token: {confirm[:20]}...")
-            url = (
-                # f"https://drive.usercontent.google.com/download"
-                # f"?id={file_id}&export=download&confirm={confirm}"
-                f"https://drive.google.com/file/d/"
-                f"{file_id}/view?usp=sharing&confirm={confirm}"
-            )
-            resp = session.get(url, stream=True, timeout=120, headers=headers)
-            resp.raise_for_status()
-            content_type = resp.headers.get("Content-Type", "")
-            print(f"[Drive] Content-Type sau confirm: {content_type}")
-        else:
-            # ── Thử 2: endpoint cũ với cookie ──────────────
-            print("[Drive] Không tìm được token, thử endpoint cũ...")
-            url2 = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
-            resp2 = session.get(url2, stream=True, timeout=120, headers=headers)
-            resp2.raise_for_status()
-            # Lấy confirm từ cookie
-            token = next(
-                (v for k, v in resp2.cookies.items() if k.startswith("download_warning")),
-                None
-            )
-            if token:
-                url2 = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing&confirm={token}"
-                resp = session.get(url2, stream=True, timeout=120, headers=headers)
-                resp.raise_for_status()
-            else:
-                raise Exception(
-                    f"Google Drive không cho download file này. "
-                    f"Hãy đảm bảo file được share 'Anyone with the link'. "
-                    f"File ID: {file_id}"
-                )
-
-    # ── Ghi file ───────────────────────────────────────────
-    with open(dest, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=65536):
-            if chunk:
-                f.write(chunk)
+    if not os.path.exists(dest):
+        raise Exception(f"gdown không tạo được file. File ID: {file_id}")
 
     size_mb = os.path.getsize(dest) / 1024 / 1024
     print(f"[Drive] Downloaded: {size_mb:.2f} MB")
@@ -114,17 +52,17 @@ def download_from_google_drive(file_id: str, dest: str):
         magic = f.read(16)
     print(f"[Drive] Magic bytes: {magic.hex()}")
 
-    # HTML thường bắt đầu bằng '<' (0x3c) hoặc '<!DOCTYPE'
+    # HTML thường bắt đầu bằng '<' (0x3c)
     if magic[:1] == b'<' or magic[:5].lower() == b'<!doc':
         os.remove(dest)
         raise Exception(
             f"Google Drive trả về trang HTML thay vì video. "
-            f"File chưa được share public hoặc yêu cầu đăng nhập. "
+            f"File chưa được share 'Anyone with the link'. "
             f"File ID: {file_id}"
         )
 
     if size_mb < 0.1:
-        raise Exception(f"File tải về quá nhỏ ({size_mb:.2f}MB) — download thất bại")
+        raise Exception(f"File quá nhỏ ({size_mb:.2f}MB) — download thất bại")
 
 
 def download_file(url: str, dest: str):
@@ -135,6 +73,7 @@ def download_file(url: str, dest: str):
         download_from_google_drive(file_id, dest)
         return
 
+    # URL thường (không phải Drive)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": "https://www.google.com",
@@ -194,7 +133,7 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
 
         dur = get_duration(src)
         print(f"[{uid}] Duration: {dur:.1f}s")
-        
+
         # Kiểm tra video stream
         probe = subprocess.run([
             "ffprobe", "-v", "error", "-show_streams",
@@ -202,17 +141,14 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
             "-show_entries", "stream=codec_name,width,height",
             "-of", "json", src
         ], capture_output=True, text=True)
-        probe_data = json.loads(probe.stdout)
-        video_streams = probe_data.get("streams", [])
+        video_streams = json.loads(probe.stdout).get("streams", [])
         print(f"[{uid}] Video streams: {video_streams}")
 
         if not video_streams:
             raise Exception(
                 "File không có video stream — chỉ có audio. "
-                "File MP4 trên Google Drive bị lỗi hoặc là audio file. "
-                "Hãy kiểm tra và upload lại file video."
+                "Kiểm tra lại file trên Google Drive."
             )
-
 
         # 2 ── Resize 9:16
         print(f"[{uid}] Resize 9:16...")
