@@ -132,6 +132,9 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
 
         if mb < 0.1:
             raise Exception(f"File quá nhỏ ({mb:.2f}MB) — download thất bại")
+            
+        dur = get_duration(src) 
+        print(f"[{uid}] Duration: {dur:.1f}s")
         
 
         # 2 ── Resize 9:16
