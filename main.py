@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import subprocess, requests, os, uuid, json, base64, shutil
+import subprocess, requests, os, uuid, json, base64, shutil, re
 from pathlib import Path
 
 app = Flask(__name__)
@@ -17,60 +17,123 @@ OUTPUT_DIR  = "/tmp/outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+def extract_drive_file_id(url: str) -> str:
+    """Trích xuất file ID từ mọi dạng URL Google Drive"""
+    # Dạng: /file/d/FILE_ID/view
+    m = re.search(r'/file/d/([a-zA-Z0-9_\-]+)', url)
+    if m:
+        return m.group(1)
+    # Dạng: ?id=FILE_ID hoặc &id=FILE_ID
+    m = re.search(r'[?&]id=([a-zA-Z0-9_\-]+)', url)
+    if m:
+        return m.group(1)
+    raise Exception(f"Không tìm được file ID trong URL: {url}")
+
+
 def download_from_google_drive(file_id: str, dest: str):
-    """Download file từ Google Drive — xử lý cả virus scan warning mới"""
+    """
+    Download file từ Google Drive.
+    Xử lý virus-scan warning page và kiểm tra nội dung thực sự là video.
+    """
     session = requests.Session()
-    
-    # Thử endpoint mới của Google Drive
-    url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0&confirm=t"
-    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
-    
-    response = session.get(url, stream=True, timeout=120, headers=headers)
-    response.raise_for_status()
-    
-    # Kiểm tra có phải HTML không (tức là bị redirect sang trang cảnh báo)
-    content_type = response.headers.get("Content-Type", "")
+
+    # ── Thử 1: endpoint mới với confirm=t ──────────────────
+    url = (
+        f"https://drive.usercontent.google.com/download"
+        f"?id={file_id}&export=download&authuser=0&confirm=t"
+    )
+    resp = session.get(url, stream=True, timeout=120, headers=headers)
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("Content-Type", "")
+    print(f"[Drive] Content-Type: {content_type}")
+
+    # Nếu trả về HTML → cần lấy confirm token từ page body
     if "text/html" in content_type:
-        # Thử lấy confirm token từ body HTML
-        import re
-        html = response.text
+        html = resp.text
+
+        # Tìm confirm token mới (dạng uuid hoặc chữ+số)
         match = re.search(r'confirm=([0-9A-Za-z_\-]+)', html)
+        if not match:
+            # Thử tìm trong form action
+            match = re.search(r'["\']confirm["\'].*?value=["\']([^"\']+)["\']', html)
+
         if match:
             confirm = match.group(1)
-            url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={confirm}"
-            response = session.get(url, stream=True, timeout=120, headers=headers)
-            response.raise_for_status()
+            print(f"[Drive] Got confirm token: {confirm[:20]}...")
+            url = (
+                f"https://drive.usercontent.google.com/download"
+                f"?id={file_id}&export=download&confirm={confirm}"
+            )
+            resp = session.get(url, stream=True, timeout=120, headers=headers)
+            resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "")
+            print(f"[Drive] Content-Type sau confirm: {content_type}")
         else:
-            raise Exception(f"Google Drive yêu cầu đăng nhập hoặc file không public. File ID: {file_id}")
-    
+            # ── Thử 2: endpoint cũ với cookie ──────────────
+            print("[Drive] Không tìm được token, thử endpoint cũ...")
+            url2 = f"https://drive.google.com/uc?export=download&id={file_id}"
+            resp2 = session.get(url2, stream=True, timeout=120, headers=headers)
+            resp2.raise_for_status()
+            # Lấy confirm từ cookie
+            token = next(
+                (v for k, v in resp2.cookies.items() if k.startswith("download_warning")),
+                None
+            )
+            if token:
+                url2 = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={token}"
+                resp = session.get(url2, stream=True, timeout=120, headers=headers)
+                resp.raise_for_status()
+            else:
+                raise Exception(
+                    f"Google Drive không cho download file này. "
+                    f"Hãy đảm bảo file được share 'Anyone with the link'. "
+                    f"File ID: {file_id}"
+                )
+
+    # ── Ghi file ───────────────────────────────────────────
     with open(dest, "wb") as f:
-        for chunk in response.iter_content(chunk_size=65536):
+        for chunk in resp.iter_content(chunk_size=65536):
             if chunk:
                 f.write(chunk)
-    
+
     size_mb = os.path.getsize(dest) / 1024 / 1024
-    print(f"Drive download done: {size_mb:.1f} MB")
-    
-    if size_mb < 0.05:
-        raise Exception(f"File tải về quá nhỏ ({size_mb:.2f}MB) — Drive có thể chặn hoặc file không public")
+    print(f"[Drive] Downloaded: {size_mb:.2f} MB")
+
+    # Kiểm tra file có phải video thật không (không phải HTML)
+    with open(dest, "rb") as f:
+        magic = f.read(16)
+    print(f"[Drive] Magic bytes: {magic.hex()}")
+
+    # HTML thường bắt đầu bằng '<' (0x3c) hoặc '<!DOCTYPE'
+    if magic[:1] == b'<' or magic[:5].lower() == b'<!doc':
+        os.remove(dest)
+        raise Exception(
+            f"Google Drive trả về trang HTML thay vì video. "
+            f"File chưa được share public hoặc yêu cầu đăng nhập. "
+            f"File ID: {file_id}"
+        )
+
+    if size_mb < 0.1:
+        raise Exception(f"File tải về quá nhỏ ({size_mb:.2f}MB) — download thất bại")
 
 
 def download_file(url: str, dest: str):
     """Download file — tự nhận biết Google Drive hay URL thường"""
-    if "drive.google.com" in url:
-        if "id=" in url:
-            file_id = url.split("id=")[1].split("&")[0]
-        elif "/file/d/" in url:
-            file_id = url.split("/file/d/")[1].split("/")[0]
-        else:
-            raise Exception(f"Cannot extract Drive file ID from: {url}")
+    if "drive.google.com" in url or "drive.usercontent.google.com" in url:
+        file_id = extract_drive_file_id(url)
+        print(f"[Drive] File ID: {file_id}")
         download_from_google_drive(file_id, dest)
         return
 
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.google.com",
+    }
     r = requests.get(url, stream=True, timeout=120, headers=headers)
     r.raise_for_status()
     with open(dest, "wb") as f:
@@ -80,10 +143,10 @@ def download_file(url: str, dest: str):
 
 
 def create_subtitle_file(text: str, duration: float, path: str):
-    words      = text.split()
-    chunks     = [" ".join(words[i:i+6]) for i in range(0, len(words), 6)] or [text]
-    seg_dur    = duration / max(len(chunks), 1)
-    content    = ""
+    words   = text.split()
+    chunks  = [" ".join(words[i:i+6]) for i in range(0, len(words), 6)] or [text]
+    seg_dur = duration / max(len(chunks), 1)
+    content = ""
     for i, chunk in enumerate(chunks):
         s = i * seg_dur
         e = min((i + 1) * seg_dur, duration)
@@ -121,21 +184,11 @@ def process_video(mp4_url: str, title: str, caption: str) -> str:
         print(f"[{uid}] Downloading: {mp4_url[:80]}...")
         download_file(mp4_url, src)
 
-        # Kiểm tra file
         mb = os.path.getsize(src) / 1024 / 1024
         print(f"[{uid}] Downloaded: {mb:.2f} MB")
 
-        # Đọc vài byte đầu để verify là video thật
-        with open(src, "rb") as f:
-            header = f.read(12)
-        print(f"[{uid}] File header: {header.hex()}")  # MP4 thường bắt đầu bằng ftyp
-
-        if mb < 0.1:
-            raise Exception(f"File quá nhỏ ({mb:.2f}MB) — download thất bại")
-            
-        dur = get_duration(src) 
+        dur = get_duration(src)
         print(f"[{uid}] Duration: {dur:.1f}s")
-        
 
         # 2 ── Resize 9:16
         print(f"[{uid}] Resize 9:16...")
@@ -210,7 +263,7 @@ def health():
 
 @app.route("/process", methods=["POST"])
 def handle_process():
-    data = request.json or {}
+    data     = request.json or {}
     mp4_url  = data.get("mp4_url", "")
     title    = data.get("title", "video")
     caption  = data.get("caption", "")
